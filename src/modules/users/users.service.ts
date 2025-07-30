@@ -562,8 +562,6 @@ export class UserService {
 
     if (existingDoc) await this.deleteDoc(existingDoc);
 
-
-
     if (!createUserDocDto?.user_id) {
       createUserDocDto.user_id = userDetails?.user_id;
     }
@@ -572,6 +570,43 @@ export class UserService {
     try {
       const savedDoc = await this.saveDoc(createUserDocDto);
       await this.writeToFile(createUserDocDto, userFilePath, savedDoc);
+
+      // Register watcher if imported_from is e-wallet or QR Code
+      if (createUserDocDto.imported_from && 
+          (createUserDocDto.imported_from.toLowerCase() === 'e-wallet' || 
+           createUserDocDto.imported_from.toLowerCase() === 'qr code')) {
+        
+        // Use provided email and callback URL or defaults
+        const email = createUserDocDto.watcher_email || userDetails.email || 'default@example.com';
+        const callbackUrl = createUserDocDto.watcher_callback_url || 
+                           `${process.env.BASE_URL || 'http://localhost:3000'}/api/wallet/vcs/watch/callback`;
+
+        try {
+          const watcherResult = await this.registerWatcher(
+            createUserDocDto.imported_from,
+            createUserDocDto.doc_data,
+            email,
+            callbackUrl
+          );
+
+          if (watcherResult.success) {
+            // Update the saved document with watcher information
+            savedDoc.watcher_registered = true;
+            savedDoc.watcher_email = email;
+            savedDoc.watcher_callback_url = callbackUrl;
+            
+            // Save the updated document
+            await this.userDocsRepository.save(savedDoc);
+            
+            Logger.log(`Watcher registered successfully for document: ${savedDoc.doc_id}`);
+          } else {
+            Logger.warn(`Watcher registration failed for document: ${savedDoc.doc_id}, Error: ${watcherResult.message}`);
+          }
+        } catch (watcherError) {
+          Logger.error(`Error during watcher registration for document: ${savedDoc.doc_id}`, watcherError);
+        }
+      }
+
       return savedDoc;
     } catch (error) {
       Logger.error('Error processing document:', error);
@@ -1038,6 +1073,131 @@ export class UserService {
           error.message ??
           'VC Verification failed',
         errors: error?.response?.data?.errors,
+      };
+    }
+  }
+
+  // Register watcher for e-wallet
+  private async registerWatcherForEWallet(
+    vcPublicId: string,
+    email: string,
+    callbackUrl: string
+  ): Promise<{ success: boolean; message?: string; data?: any }> {
+    try {
+      const walletUrl = process.env.WALLET_WATCHER_URL || 'localhost:3018/api/wallet/vcs/watch';
+      const authToken = process.env.WALLET_AUTH_TOKEN || '8779cc8a-a1fc-499c-9b19-400551041739';
+
+      const payload = {
+        vcPublicId: vcPublicId,
+        email: email,
+        callbackUrl: callbackUrl
+      };
+
+      const response = await axios.post(walletUrl, payload, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authToken}`
+        },
+        timeout: 10000,
+      });
+
+      return {
+        success: true,
+        message: 'Watcher registered successfully',
+        data: response.data
+      };
+    } catch (error) {
+      Logger.error('E-Wallet watcher registration error:', error?.response?.data ?? error.message);
+      return {
+        success: false,
+        message: error?.response?.data?.message ?? error.message ?? 'Watcher registration failed',
+        data: error?.response?.data
+      };
+    }
+  }
+
+  // Register watcher for QR Code (Dhiway)
+  private async registerWatcherForQRCode(
+    identifier: string,
+    recordPublicId: string,
+    email: string,
+    callbackUrl: string
+  ): Promise<{ success: boolean; message?: string; data?: any }> {
+    try {
+      const dhiwayUrl = process.env.DHIWAY_WATCHER_URL || 'https://api.depwd.onest.dhiway.net/api/watch';
+      const cookie = process.env.DHIWAY_COOKIE || 'connect.sid=s%3Ae2I4C8LHipRmYG3apc6Nge5J2eVsseCw.gokVPhLHYd%2BWjdks1qjcsKFyLdxpBVFinpIHkJi44FU';
+
+      const payload = {
+        identifier: identifier,
+        recordPublicId: recordPublicId,
+        email: email,
+        callbackUrl: callbackUrl
+      };
+
+      const response = await axios.post(dhiwayUrl, payload, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Cookie': cookie
+        },
+        timeout: 10000,
+      });
+
+      return {
+        success: true,
+        message: 'Watcher registered successfully',
+        data: response.data
+      };
+    } catch (error) {
+      Logger.error('QR Code watcher registration error:', error?.response?.data ?? error.message);
+      return {
+        success: false,
+        message: error?.response?.data?.message ?? error.message ?? 'Watcher registration failed',
+        data: error?.response?.data
+      };
+    }
+  }
+
+  // Register watcher based on imported_from
+  private async registerWatcher(
+    importedFrom: string,
+    docData: any,
+    email: string,
+    callbackUrl: string
+  ): Promise<{ success: boolean; message?: string; data?: any }> {
+    try {
+      if (importedFrom.toLowerCase() === 'e-wallet') {
+        // Extract vcPublicId from doc_data
+        const vcPublicId = docData?.vcPublicId || docData?.id || docData?.credential?.id;
+        if (!vcPublicId) {
+          return {
+            success: false,
+            message: 'vcPublicId not found in document data'
+          };
+        }
+        return await this.registerWatcherForEWallet(vcPublicId, email, callbackUrl);
+      } else if (importedFrom.toLowerCase() === 'qr code') {
+        // Extract identifier and recordPublicId from doc_data
+        const identifier = docData?.identifier || docData?.credential?.identifier;
+        const recordPublicId = docData?.recordPublicId || docData?.credential?.recordPublicId;
+        
+        if (!identifier || !recordPublicId) {
+          return {
+            success: false,
+            message: 'identifier or recordPublicId not found in document data'
+          };
+        }
+        return await this.registerWatcherForQRCode(identifier, recordPublicId, email, callbackUrl);
+      } else {
+        return {
+          success: false,
+          message: `Watcher registration not supported for imported_from: ${importedFrom}`
+        };
+      }
+    } catch (error) {
+      Logger.error('Watcher registration error:', error);
+      return {
+        success: false,
+        message: error.message || 'Watcher registration failed'
       };
     }
   }
